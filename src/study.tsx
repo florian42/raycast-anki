@@ -1,15 +1,10 @@
-import { Action, ActionPanel, Detail, Keyboard } from "@raycast/api";
+import { Action, ActionPanel, Detail, Keyboard, showToast, Toast } from "@raycast/api";
 import { showFailureToast, usePromise } from "@raycast/utils";
 import { useCallback, useState } from "react";
-import TurndownService from "turndown";
 
 import { YankiConnect } from "yanki-connect";
 
 const client = new YankiConnect({ autoLaunch: true });
-const turndownService = new TurndownService({
-  codeBlockStyle: "fenced",
-  headingStyle: "atx",
-});
 
 const DEFAULT_DECK = "My Deck";
 type Ease = 1 | 2 | 3 | 4;
@@ -113,14 +108,23 @@ async function ankiHtmlToMarkdown(html: string): Promise<string> {
   const cleaned = html
     .replace(/<style[\s\S]*?<\/style>/gi, "")
     .replace(/<script[\s\S]*?<\/script>/gi, "")
-    .replace(/<hr id=["']?answer["']?\s*\/?>/gi, "\n---\n");
+    .replace(/<hr id=["']?answer["']?\s*\/?>/gi, "\n---\n")
+    .replace(/<div>/gi, "\n")
+    .replace(/<\/div>/gi, "")
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<b>(.*?)<\/b>/gi, "**$1**")
+    .replace(/<i>(.*?)<\/i>/gi, "_$1_")
+    .replace(/<u>(.*?)<\/u>/gi, "$1") // Markdown doesn't support underline
+    .replace(/<(?:.|\n)*?>/gm, ""); // Remove remaining tags
 
-  const markdown = turndownService
-    .turndown(cleaned)
+  const markdown = cleaned
     .replace(/\[sound:([^\]]+)\]/g, "Audio: `$1`")
     .trim();
 
-  return inlineMarkdownImages(markdown);
+  // Basic image parsing to pick up <img> tags and convert them to markdown syntax for processing
+  const withMarkdownImages = html.replace(/<img src=["'](.*?)["']\s*\/?>/gi, "![]($1)");
+
+  return inlineMarkdownImages(withMarkdownImages.length > cleaned.length ? withMarkdownImages : markdown);
 }
 
 /**
@@ -236,11 +240,21 @@ async function resolveImageSource(source: string): Promise<string> {
   try {
     const encodedFile = await client.media.retrieveMediaFile({ filename });
     if (!encodedFile) {
+      await showToast({
+        style: Toast.Style.Failure,
+        title: "Media not found",
+        message: `Could not find ${filename} in Anki media.`,
+      });
       return source;
     }
 
     return `data:${guessImageMimeType(filename)};base64,${encodedFile}`;
-  } catch {
+  } catch (error) {
+    await showToast({
+      style: Toast.Style.Failure,
+      title: "Anki Connection Error",
+      message: "Could not retrieve media file.",
+    });
     return source;
   }
 }
