@@ -249,7 +249,7 @@ async function resolveImageSource(source: string): Promise<string> {
     }
 
     return `data:${guessImageMimeType(filename)};base64,${encodedFile}`;
-  } catch (error) {
+  } catch {
     await showToast({
       style: Toast.Style.Failure,
       title: "Anki Connection Error",
