@@ -13,10 +13,11 @@ const turndownService = new TurndownService({
 
 const DEFAULT_DECK = "My Deck";
 type Ease = 1 | 2 | 3 | 4;
+const MARKDOWN_IMAGE_REGEX = /!\[([^\]]*)\]\((\S+?)(?:\s+"([^"]*)")?\)/g;
 
 export default function Command() {
   const [showAnswer, setShowAnswer] = useState(false);
-  const { isLoading, data, mutate, revalidate } = usePromise(getNextDueCard, [DEFAULT_DECK], {
+  const { isLoading, data, mutate, revalidate } = usePromise(getNextDueCardWithMarkdown, [DEFAULT_DECK], {
     onData: () => setShowAnswer(false),
     onError: (error) => {
       void showFailureToast(error, { title: "Failed to load due card" });
@@ -90,10 +91,11 @@ export default function Command() {
 }
 
 type CardInfo = NonNullable<Awaited<ReturnType<typeof getNextDueCard>>>;
+type CardWithMarkdown = CardInfo & { questionMarkdown: string; answerMarkdown: string };
 
-function renderCardAsMarkdown(card: CardInfo, { showAnswer = false } = {}): string {
-  const questionMarkdown = `## Question\n\n${ankiHtmlToMarkdown(card.question)}`;
-  const answerMarkdown = showAnswer ? `## Answer\n\n${ankiHtmlToMarkdown(card.answer)}` : "";
+function renderCardAsMarkdown(card: CardWithMarkdown, { showAnswer = false } = {}): string {
+  const questionMarkdown = `## Question\n\n${card.questionMarkdown}`;
+  const answerMarkdown = showAnswer ? `## Answer\n\n${card.answerMarkdown}` : "";
 
   return [questionMarkdown, answerMarkdown].filter(Boolean).join("\n\n---\n\n");
 }
@@ -104,20 +106,29 @@ function renderCardAsMarkdown(card: CardInfo, { showAnswer = false } = {}): stri
  * We intentionally clean a few Anki-specific/HTML-only parts before conversion:
  * - remove `<style>` and `<script>` blocks because Detail markdown doesn't apply card CSS/JS
  * - normalize `<hr id="answer">` into a Markdown divider so front/back boundaries stay visible
+ * - inline Anki media image sources as `data:` URLs so Raycast can render them
  * - rewrite `[sound:...]` tags into readable text since markdown cannot play Anki media syntax
  */
-function ankiHtmlToMarkdown(html: string): string {
+async function ankiHtmlToMarkdown(html: string): Promise<string> {
   const cleaned = html
     .replace(/<style[\s\S]*?<\/style>/gi, "")
     .replace(/<script[\s\S]*?<\/script>/gi, "")
     .replace(/<hr id=["']?answer["']?\s*\/?>/gi, "\n---\n");
 
-  return turndownService
+  const markdown = turndownService
     .turndown(cleaned)
     .replace(/\[sound:([^\]]+)\]/g, "Audio: `$1`")
     .trim();
+
+  return inlineMarkdownImages(markdown);
 }
 
+/**
+ * Fetches the next due card for a deck from Anki.
+ *
+ * This intentionally returns only one card because the command is a
+ * single-card review flow (show question, reveal answer, submit ease, repeat).
+ */
 async function getNextDueCard(deckName = DEFAULT_DECK) {
   const dueCardIds = await client.card.findCards({
     query: `deck:"${deckName}" is:due`,
@@ -133,4 +144,133 @@ async function getNextDueCard(deckName = DEFAULT_DECK) {
   });
 
   return nextCard;
+}
+
+/**
+ * Fetches the next due card and precomputes markdown for both sides.
+ *
+ * Precomputing once avoids repeating HTML/media conversion every render and
+ * keeps the component render path synchronous and cheap.
+ */
+async function getNextDueCardWithMarkdown(deckName = DEFAULT_DECK): Promise<CardWithMarkdown | undefined> {
+  const card = await getNextDueCard(deckName);
+  if (!card) {
+    return undefined;
+  }
+
+  const [questionMarkdown, answerMarkdown] = await Promise.all([
+    ankiHtmlToMarkdown(card.question),
+    ankiHtmlToMarkdown(card.answer),
+  ]);
+
+  return {
+    ...card,
+    answerMarkdown,
+    questionMarkdown,
+  };
+}
+
+/**
+ * Rewrites markdown image URLs so local Anki media can render in Raycast.
+ *
+ * We resolve each unique source once to avoid duplicate Anki API calls when the
+ * same image appears multiple times.
+ */
+async function inlineMarkdownImages(markdown: string): Promise<string> {
+  const sources = new Set<string>();
+  for (const match of markdown.matchAll(MARKDOWN_IMAGE_REGEX)) {
+    const source = match[2];
+    if (source) {
+      sources.add(source);
+    }
+  }
+
+  if (sources.size === 0) {
+    return markdown;
+  }
+
+  const resolvedSources = new Map<string, string>();
+  await Promise.all(
+    [...sources].map(async (source) => {
+      resolvedSources.set(source, await resolveImageSource(source));
+    }),
+  );
+
+  return markdown.replace(MARKDOWN_IMAGE_REGEX, (fullMatch, altText: string, source: string, title?: string) => {
+    const resolved = resolvedSources.get(source);
+    if (!resolved || resolved === source) {
+      return fullMatch;
+    }
+
+    const titleSuffix = title ? ` "${title}"` : "";
+    return `![${altText}](${resolved}${titleSuffix})`;
+  });
+}
+
+/**
+ * Converts an image source into a Raycast-renderable URL when needed.
+ *
+ * Remote/data/file URLs are already renderable and are returned unchanged.
+ * Relative Anki media names are loaded via AnkiConnect and converted to `data:`
+ * URLs so they work inside markdown without filesystem assumptions.
+ */
+async function resolveImageSource(source: string): Promise<string> {
+  const trimmed = source.trim();
+  if (!trimmed || /^(https?:|data:|file:)/i.test(trimmed)) {
+    return source;
+  }
+
+  const withoutQueryOrHash = trimmed.replace(/[?#].*$/, "");
+  let filename = withoutQueryOrHash;
+
+  try {
+    filename = decodeURIComponent(withoutQueryOrHash);
+  } catch {
+    // Keep original value if URL decoding fails.
+  }
+
+  if (!filename) {
+    return source;
+  }
+
+  try {
+    const encodedFile = await client.media.retrieveMediaFile({ filename });
+    if (!encodedFile) {
+      return source;
+    }
+
+    return `data:${guessImageMimeType(filename)};base64,${encodedFile}`;
+  } catch {
+    return source;
+  }
+}
+
+/**
+ * Chooses a MIME type from a filename extension for `data:` image URLs.
+ *
+ * A specific MIME improves renderer compatibility; unknown extensions fall back
+ * to `application/octet-stream`.
+ */
+function guessImageMimeType(filename: string): string {
+  const extension = filename.split(".").pop()?.toLowerCase();
+  switch (extension) {
+    case "apng":
+      return "image/apng";
+    case "avif":
+      return "image/avif";
+    case "gif":
+      return "image/gif";
+    case "jpeg":
+    case "jpg":
+      return "image/jpeg";
+    case "png":
+      return "image/png";
+    case "svg":
+    case "svgz":
+      return "image/svg+xml";
+    case "webp":
+      return "image/webp";
+    default:
+      return "application/octet-stream";
+  }
 }
