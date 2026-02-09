@@ -6,24 +6,21 @@ export type CardInfo = NonNullable<Awaited<ReturnType<typeof getNextDueCard>>>;
 export type Ease = 1 | 2 | 3 | 4;
 
 /**
- * Fetches the next due card for a deck from Anki.
+ * Fetches the next due card for a deck using Anki's GUI scheduler.
  *
- * This intentionally returns only one card because the command is a
- * single-card review flow (show question, reveal answer, submit ease, repeat).
+ * We start (or reuse) the deck review session and read the current card from
+ * Anki. This mirrors the GUI review ordering, including learning/review queues
+ * and any deck-specific scheduling rules.
  */
 export async function getNextDueCard(deckName: string) {
-  const dueCardIds = await client.card.findCards({
-    query: `deck:"${deckName}" is:due`,
-  });
+  await client.graphical.guiDeckReview({ name: deckName });
 
-  const nextCardId = dueCardIds[0];
-  if (!nextCardId) {
+  const nextCard = await client.graphical.guiCurrentCard();
+  if (!nextCard) {
     return undefined;
   }
 
-  const [nextCard] = await client.card.cardsInfo({
-    cards: [nextCardId],
-  });
+  await client.graphical.guiStartCardTimer();
 
   return nextCard;
 }
@@ -31,9 +28,8 @@ export async function getNextDueCard(deckName: string) {
 type CardId = CardInfo["cardId"];
 
 export function answerCard(cardId: CardId, ease: Ease) {
-  return client.card.answerCards({
-    answers: [{ cardId, ease }],
-  });
+  void cardId;
+  return client.graphical.guiShowAnswer().then(() => client.graphical.guiAnswerCard({ ease }));
 }
 
 /**
