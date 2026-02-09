@@ -26,6 +26,7 @@ export default function StudyCommand() {
           card={data}
           showAnswer={showAnswer}
           setShowAnswer={setShowAnswer}
+          isLoading={isLoading}
           mutate={mutate}
           revalidate={revalidate}
         />
@@ -40,12 +41,14 @@ function CardActionsPanel({
   card,
   showAnswer,
   setShowAnswer,
+  isLoading,
   mutate,
   revalidate,
 }: {
   card: CardInfo | undefined;
   showAnswer: boolean;
   setShowAnswer: (showAnswer: boolean) => void;
+  isLoading: boolean;
   mutate: MutateCard;
   revalidate: RevalidateCard;
 }) {
@@ -54,7 +57,7 @@ function CardActionsPanel({
       {card && !showAnswer ? (
         <Action title="Show Answer" onAction={() => setShowAnswer(true)} shortcut={{ modifiers: [], key: "space" }} />
       ) : null}
-      {card && showAnswer && <CardActions card={card} mutate={mutate} />}
+      {card && showAnswer && <CardActions card={card} isLoading={isLoading} mutate={mutate} />}
       <Action title="Reload Due Card" onAction={() => revalidate()} shortcut={Keyboard.Shortcut.Common.Refresh} />
     </ActionPanel>
   );
@@ -69,14 +72,21 @@ const ANSWER_ACTIONS = [
   { ease: 4 as const, label: "Easy", key: "4" as Keyboard.KeyEquivalent },
 ];
 
-function CardActions({ card, mutate }: { card: CardInfo; mutate: MutateCard }) {
+function CardActions({ card, isLoading, mutate }: { card: CardInfo; isLoading: boolean; mutate: MutateCard }) {
+  const [isSubmitting, setIsSubmitting] = useState(false);
+
   const handleAnswer = useCallback(
     (ease: Ease) => {
-      void mutate(answerCard(card.cardId, ease)).catch((error) =>
-        showFailureToast(error, { title: "Failed to submit review" }),
-      );
+      if (isSubmitting || isLoading) {
+        return;
+      }
+
+      setIsSubmitting(true);
+      void mutate(answerCard(card.cardId, ease))
+        .catch((error) => showFailureToast(error, { title: "Failed to submit review" }))
+        .finally(() => setIsSubmitting(false));
     },
-    [card, mutate],
+    [card, isLoading, isSubmitting, mutate],
   );
 
   return (
@@ -86,6 +96,7 @@ function CardActions({ card, mutate }: { card: CardInfo; mutate: MutateCard }) {
           key={action.ease}
           title={card.nextReviews[index] ? `${action.label} (${card.nextReviews[index]})` : action.label}
           onAction={() => handleAnswer(action.ease)}
+          disabled={isSubmitting || isLoading}
           shortcut={{ modifiers: [], key: action.key }}
         />
       ))}
